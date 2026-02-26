@@ -107,6 +107,7 @@ impl Store {
             digest.as_deref(),
             &manifest_str,
             size_on_disk,
+            "component",
         )?;
 
         let manifest = image.manifest.clone();
@@ -157,6 +158,7 @@ impl Store {
             digest,
             &manifest_str,
             size_on_disk,
+            "component",
         )
     }
 
@@ -185,6 +187,22 @@ impl Store {
         let Some(metadata) = extract_wit_metadata(wasm_bytes) else {
             return; // Not a valid wasm component, skip
         };
+
+        // Update the image's package_type based on the detected type
+        let package_type = if crate::utils::is_wit_package(wasm_bytes) {
+            "interface"
+        } else {
+            "component"
+        };
+        if let Err(e) = self.conn.execute(
+            "UPDATE image SET package_type = ?1 WHERE id = ?2",
+            (package_type, image_id),
+        ) {
+            eprintln!(
+                "Warning: Failed to update package_type for image {}: {}",
+                image_id, e
+            );
+        }
 
         // Insert the WIT interface
         let wit_id = match WitInterface::insert(

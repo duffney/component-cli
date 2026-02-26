@@ -39,6 +39,8 @@ pub struct InstallResult {
     pub package_name: Option<String>,
     /// The list of vendored file paths.
     pub vendored_files: Vec<std::path::PathBuf>,
+    /// Whether this package is a compiled component (`true`) or a WIT interface (`false`).
+    pub is_component: bool,
 }
 
 /// A cache on disk
@@ -314,11 +316,13 @@ impl Manager {
         vendor_dir: &Path,
     ) -> anyhow::Result<InstallResult> {
         use crate::storage::wit_parser::extract_wit_metadata;
+        use crate::utils::is_wit_package;
 
         let pull_result = self.pull(reference.clone()).await?;
 
         let mut vendored_files = Vec::new();
         let mut package_name = None;
+        let mut is_component = true; // Default to component
 
         // Pre-compute filename parts from the OCI reference and image digest.
         // We use the image digest (not layer digest) so it matches the lockfile.
@@ -347,12 +351,14 @@ impl Manager {
                     self.vendor(&layer.digest, &dest).await?;
                     vendored_files.push(dest);
 
-                    // Try to extract WIT package name from the layer data
+                    // Try to extract WIT package name and detect type from the layer data
                     if package_name.is_none()
                         && let Ok(data) = self.get(&layer.digest).await
-                        && let Some(metadata) = extract_wit_metadata(&data)
                     {
-                        package_name = metadata.package_name;
+                        is_component = !is_wit_package(&data);
+                        if let Some(metadata) = extract_wit_metadata(&data) {
+                            package_name = metadata.package_name;
+                        }
                     }
                 }
             }
@@ -365,6 +371,7 @@ impl Manager {
             digest: pull_result.digest,
             package_name,
             vendored_files,
+            is_component,
         })
     }
 
@@ -383,6 +390,7 @@ impl Manager {
         progress_tx: &tokio::sync::mpsc::Sender<ProgressEvent>,
     ) -> anyhow::Result<InstallResult> {
         use crate::storage::wit_parser::extract_wit_metadata;
+        use crate::utils::is_wit_package;
 
         let pull_result = self
             .pull_with_progress(reference.clone(), progress_tx)
@@ -390,6 +398,7 @@ impl Manager {
 
         let mut vendored_files = Vec::new();
         let mut package_name = None;
+        let mut is_component = true; // Default to component
 
         // Pre-compute filename parts from the OCI reference and image digest.
         let registry_part = reference.registry().replace('.', "-");
@@ -417,12 +426,14 @@ impl Manager {
                     self.vendor(&layer.digest, &dest).await?;
                     vendored_files.push(dest);
 
-                    // Try to extract WIT package name from the layer data
+                    // Try to extract WIT package name and detect type from the layer data
                     if package_name.is_none()
                         && let Ok(data) = self.get(&layer.digest).await
-                        && let Some(metadata) = extract_wit_metadata(&data)
                     {
-                        package_name = metadata.package_name;
+                        is_component = !is_wit_package(&data);
+                        if let Some(metadata) = extract_wit_metadata(&data) {
+                            package_name = metadata.package_name;
+                        }
                     }
                 }
             }
@@ -437,6 +448,7 @@ impl Manager {
             digest: pull_result.digest,
             package_name,
             vendored_files,
+            is_component,
         })
     }
     /// List all stored images and their metadata.

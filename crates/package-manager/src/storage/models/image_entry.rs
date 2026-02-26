@@ -86,6 +86,7 @@ impl ImageEntry {
     /// Uses atomic `INSERT ... ON CONFLICT DO NOTHING` to prevent race conditions.
     /// Returns `(InsertResult::AlreadyExists, None)` if the entry already exists,
     /// or `(InsertResult::Inserted, Some(id))` if it was successfully inserted.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn insert(
         conn: &Connection,
         ref_registry: &str,
@@ -94,14 +95,15 @@ impl ImageEntry {
         ref_digest: Option<&str>,
         manifest: &str,
         size_on_disk: u64,
+        package_type: &str,
     ) -> anyhow::Result<(InsertResult, Option<i64>)> {
         // Use atomic upsert to prevent race conditions
         // The unique index uses COALESCE for NULL handling, so we match that pattern
         let rows_affected = conn.execute(
-            "INSERT INTO image (ref_registry, ref_repository, ref_tag, ref_digest, manifest, size_on_disk) 
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO image (ref_registry, ref_repository, ref_tag, ref_digest, manifest, size_on_disk, package_type) 
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(ref_registry, ref_repository, COALESCE(ref_tag, ''), COALESCE(ref_digest, '')) DO NOTHING",
-            (ref_registry, ref_repository, ref_tag, ref_digest, manifest, size_on_disk as i64),
+            (ref_registry, ref_repository, ref_tag, ref_digest, manifest, size_on_disk as i64, package_type),
         )?;
 
         if rows_affected == 0 {
@@ -261,6 +263,7 @@ mod tests {
             None,
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
 
@@ -281,6 +284,7 @@ mod tests {
             None,
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
         assert_eq!(result1.0, InsertResult::Inserted);
@@ -295,6 +299,7 @@ mod tests {
             None,
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
         assert_eq!(result2.0, InsertResult::AlreadyExists);
@@ -314,6 +319,7 @@ mod tests {
             None,
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
         assert_eq!(result1.0, InsertResult::Inserted);
@@ -328,6 +334,7 @@ mod tests {
             None,
             &test_manifest(),
             2048,
+            "component",
         )
         .unwrap();
         assert_eq!(result2.0, InsertResult::Inserted);
@@ -354,6 +361,7 @@ mod tests {
             None,
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
 
@@ -377,6 +385,7 @@ mod tests {
             Some("sha256:abc123"),
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
 
@@ -405,6 +414,7 @@ mod tests {
             Some("sha256:abc123"),
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
 
@@ -454,6 +464,7 @@ mod tests {
             None,
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
         ImageEntry::insert(
@@ -464,6 +475,7 @@ mod tests {
             None,
             &test_manifest(),
             2048,
+            "component",
         )
         .unwrap();
 
@@ -487,6 +499,7 @@ mod tests {
             None,
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
 
@@ -529,6 +542,7 @@ mod tests {
             Some("sha256:abc123"),
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
 
@@ -559,6 +573,7 @@ mod tests {
             None,
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
         ImageEntry::insert(
@@ -569,6 +584,7 @@ mod tests {
             None,
             &test_manifest(),
             2048,
+            "component",
         )
         .unwrap();
 
@@ -592,6 +608,7 @@ mod tests {
             None,
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
 
@@ -611,6 +628,7 @@ mod tests {
             Some("sha256:abc123"),
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
 
@@ -630,6 +648,7 @@ mod tests {
             None,
             &test_manifest(),
             1024,
+            "component",
         )
         .unwrap();
 
@@ -649,6 +668,7 @@ mod tests {
             None,
             &test_manifest(),
             12345678,
+            "component",
         )
         .unwrap();
 
