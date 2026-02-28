@@ -3,10 +3,19 @@ use oci_client::manifest::OciImageManifest;
 use std::path::Path;
 use tokio_stream::StreamExt;
 
+mod logic;
+
 use crate::config::Config;
 use crate::network::Client;
 use crate::progress::ProgressEvent;
-use crate::storage::{ImageEntry, InsertResult, KnownPackage, StateInfo, Store, WitInterface};
+use crate::storage::{
+    ImageView, InsertResult, KnownPackage, KnownPackageView, StateInfo, Store, WitInterfaceView,
+};
+
+pub use logic::{
+    TagKind, classify_tag, classify_tags, compute_orphaned_layers, filter_wasm_layers, should_sync,
+    vendor_filename,
+};
 
 /// Result of syncing the package index from a meta-registry.
 #[derive(Debug)]
@@ -368,41 +377,35 @@ impl Manager {
         let mut package_name = None;
         let mut is_component = true; // Default to component
 
-        // Pre-compute filename parts from the OCI reference and image digest.
-        // We use the image digest (not layer digest) so it matches the lockfile.
-        let registry_part = reference.registry().replace('.', "-");
-        let repo_part = reference.repository().replace('/', "-");
-        let tag_part = reference.tag().map(|t| format!("-{t}")).unwrap_or_default();
+        // Pre-compute vendor filename from the OCI reference and image digest.
         let digest_for_name = pull_result.digest.as_deref().unwrap_or("unknown");
-        let sha_part = digest_for_name
-            .strip_prefix("sha256:")
-            .unwrap_or(digest_for_name);
-        let short_sha = sha_part.get(..12).unwrap_or(sha_part);
+        let filename = vendor_filename(
+            reference.registry(),
+            reference.repository(),
+            reference.tag(),
+            digest_for_name,
+        );
 
         if let Some(ref manifest) = pull_result.manifest {
-            for layer in &manifest.layers {
-                if layer.media_type == "application/wasm" {
-                    let filename =
-                        format!("{registry_part}-{repo_part}{tag_part}-{short_sha}.wasm");
-                    let dest = vendor_dir.join(&filename);
+            for layer in filter_wasm_layers(&manifest.layers) {
+                let dest = vendor_dir.join(&filename);
 
-                    // Ensure vendor directory exists
-                    tokio::fs::create_dir_all(vendor_dir).await?;
+                // Ensure vendor directory exists
+                tokio::fs::create_dir_all(vendor_dir).await?;
 
-                    // Remove existing file if present (hard-link requires non-existent target)
-                    let _ = tokio::fs::remove_file(&dest).await;
+                // Remove existing file if present (hard-link requires non-existent target)
+                let _ = tokio::fs::remove_file(&dest).await;
 
-                    self.vendor(&layer.digest, &dest).await?;
-                    vendored_files.push(dest);
+                self.vendor(&layer.digest, &dest).await?;
+                vendored_files.push(dest);
 
-                    // Try to extract WIT package name and detect type from the layer data
-                    if package_name.is_none()
-                        && let Ok(data) = self.get(&layer.digest).await
-                    {
-                        is_component = !is_wit_package(&data);
-                        if let Some(metadata) = extract_wit_metadata(&data) {
-                            package_name = metadata.package_name;
-                        }
+                // Try to extract WIT package name and detect type from the layer data
+                if package_name.is_none()
+                    && let Ok(data) = self.get(&layer.digest).await
+                {
+                    is_component = !is_wit_package(&data);
+                    if let Some(metadata) = extract_wit_metadata(&data) {
+                        package_name = metadata.package_name;
                     }
                 }
             }
@@ -444,40 +447,35 @@ impl Manager {
         let mut package_name = None;
         let mut is_component = true; // Default to component
 
-        // Pre-compute filename parts from the OCI reference and image digest.
-        let registry_part = reference.registry().replace('.', "-");
-        let repo_part = reference.repository().replace('/', "-");
-        let tag_part = reference.tag().map(|t| format!("-{t}")).unwrap_or_default();
+        // Pre-compute vendor filename from the OCI reference and image digest.
         let digest_for_name = pull_result.digest.as_deref().unwrap_or("unknown");
-        let sha_part = digest_for_name
-            .strip_prefix("sha256:")
-            .unwrap_or(digest_for_name);
-        let short_sha = sha_part.get(..12).unwrap_or(sha_part);
+        let filename = vendor_filename(
+            reference.registry(),
+            reference.repository(),
+            reference.tag(),
+            digest_for_name,
+        );
 
         if let Some(ref manifest) = pull_result.manifest {
-            for layer in &manifest.layers {
-                if layer.media_type == "application/wasm" {
-                    let filename =
-                        format!("{registry_part}-{repo_part}{tag_part}-{short_sha}.wasm");
-                    let dest = vendor_dir.join(&filename);
+            for layer in filter_wasm_layers(&manifest.layers) {
+                let dest = vendor_dir.join(&filename);
 
-                    // Ensure vendor directory exists
-                    tokio::fs::create_dir_all(vendor_dir).await?;
+                // Ensure vendor directory exists
+                tokio::fs::create_dir_all(vendor_dir).await?;
 
-                    // Remove existing file if present (hard-link requires non-existent target)
-                    let _ = tokio::fs::remove_file(&dest).await;
+                // Remove existing file if present (hard-link requires non-existent target)
+                let _ = tokio::fs::remove_file(&dest).await;
 
-                    self.vendor(&layer.digest, &dest).await?;
-                    vendored_files.push(dest);
+                self.vendor(&layer.digest, &dest).await?;
+                vendored_files.push(dest);
 
-                    // Try to extract WIT package name and detect type from the layer data
-                    if package_name.is_none()
-                        && let Ok(data) = self.get(&layer.digest).await
-                    {
-                        is_component = !is_wit_package(&data);
-                        if let Some(metadata) = extract_wit_metadata(&data) {
-                            package_name = metadata.package_name;
-                        }
+                // Try to extract WIT package name and detect type from the layer data
+                if package_name.is_none()
+                    && let Ok(data) = self.get(&layer.digest).await
+                {
+                    is_component = !is_wit_package(&data);
+                    if let Some(metadata) = extract_wit_metadata(&data) {
+                        package_name = metadata.package_name;
                     }
                 }
             }
@@ -496,8 +494,13 @@ impl Manager {
         })
     }
     /// List all stored images and their metadata.
-    pub fn list_all(&self) -> anyhow::Result<Vec<ImageEntry>> {
-        self.store.list_all()
+    pub fn list_all(&self) -> anyhow::Result<Vec<ImageView>> {
+        Ok(self
+            .store
+            .list_all()?
+            .into_iter()
+            .map(ImageView::from)
+            .collect())
     }
 
     /// Get data from the store
@@ -529,8 +532,13 @@ impl Manager {
         query: &str,
         offset: u32,
         limit: u32,
-    ) -> anyhow::Result<Vec<KnownPackage>> {
-        self.store.search_known_packages(query, offset, limit)
+    ) -> anyhow::Result<Vec<KnownPackageView>> {
+        Ok(self
+            .store
+            .search_known_packages(query, offset, limit)?
+            .into_iter()
+            .map(KnownPackageView::from)
+            .collect())
     }
 
     /// Get all known packages.
@@ -539,8 +547,13 @@ impl Manager {
         &self,
         offset: u32,
         limit: u32,
-    ) -> anyhow::Result<Vec<KnownPackage>> {
-        self.store.list_known_packages(offset, limit)
+    ) -> anyhow::Result<Vec<KnownPackageView>> {
+        Ok(self
+            .store
+            .list_known_packages(offset, limit)?
+            .into_iter()
+            .map(KnownPackageView::from)
+            .collect())
     }
 
     /// Add or update a known package entry.
@@ -596,8 +609,11 @@ impl Manager {
         &self,
         registry: &str,
         repository: &str,
-    ) -> anyhow::Result<Option<KnownPackage>> {
-        self.store.get_known_package(registry, repository)
+    ) -> anyhow::Result<Option<KnownPackageView>> {
+        Ok(self
+            .store
+            .get_known_package(registry, repository)?
+            .map(KnownPackageView::from))
     }
 
     /// Index a package from the registry without downloading layers.
@@ -610,7 +626,7 @@ impl Manager {
     /// # Errors
     ///
     /// Returns an error if offline mode is enabled or if network operations fail.
-    pub async fn index_package(&self, reference: &Reference) -> anyhow::Result<KnownPackage> {
+    pub async fn index_package(&self, reference: &Reference) -> anyhow::Result<KnownPackageView> {
         if self.offline {
             anyhow::bail!("cannot index packages in offline mode");
         }
@@ -662,14 +678,20 @@ impl Manager {
         // Return the indexed package.
         self.store
             .get_known_package(reference.registry(), reference.repository())?
+            .map(KnownPackageView::from)
             .ok_or_else(|| anyhow::anyhow!("failed to retrieve indexed package"))
     }
 
     /// Get all WIT interfaces with their associated component references.
     pub fn list_wit_interfaces_with_components(
         &self,
-    ) -> anyhow::Result<Vec<(WitInterface, String)>> {
-        self.store.list_wit_interfaces_with_components()
+    ) -> anyhow::Result<Vec<(WitInterfaceView, String)>> {
+        Ok(self
+            .store
+            .list_wit_interfaces_with_components()?
+            .into_iter()
+            .map(|(iface, s)| (WitInterfaceView::from(iface), s))
+            .collect())
     }
 
     /// Sync the local package index from a meta-registry over HTTP.
@@ -695,15 +717,16 @@ impl Manager {
         use crate::network::registry_client::{FetchResult, RegistryClient};
 
         // Check the minimum interval unless forced.
-        if policy == SyncPolicy::IfStale
-            && let Some(last) = self.store.get_sync_meta("last_synced_at")?
-            && let Ok(last_synced_epoch) = last.parse::<i64>()
-        {
+        if policy == SyncPolicy::IfStale {
+            let last_synced_epoch = self
+                .store
+                .get_sync_meta("last_synced_at")?
+                .and_then(|s| s.parse::<i64>().ok());
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
-            if now - last_synced_epoch < sync_interval as i64 {
+            if !should_sync(last_synced_epoch, sync_interval, now) {
                 return Ok(SyncResult::Skipped);
             }
         }

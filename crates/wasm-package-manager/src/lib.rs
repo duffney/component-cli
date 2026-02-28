@@ -13,10 +13,16 @@ mod utils;
 
 pub use config::{Config, RegistryConfig};
 pub use credential_helper::CredentialHelper;
-pub use manager::{InstallResult, Manager, PullResult, SyncPolicy, SyncResult};
+pub use manager::{
+    InstallResult, Manager, PullResult, SyncPolicy, SyncResult, TagKind, classify_tag,
+    classify_tags, compute_orphaned_layers, filter_wasm_layers, should_sync, vendor_filename,
+};
 pub use oci_client::Reference;
 pub use progress::ProgressEvent;
-pub use storage::{ImageEntry, InsertResult, KnownPackage, StateInfo, WitInterface};
+pub use storage::{
+    ImageEntry, ImageView, InsertResult, KnownPackage, KnownPackageView, Migrations, StateInfo,
+    WitInterface, WitInterfaceView,
+};
 pub use utils::is_wit_package;
 
 /// Format a byte size as a human-readable string (B, KB, MB, GB).
