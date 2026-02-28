@@ -133,6 +133,89 @@ fn test_cli_self_state_help_snapshot() {
 }
 
 // =============================================================================
+// Completions Tests
+// =============================================================================
+
+#[test]
+fn test_completions_bash() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wasm"))
+        .args(&["self", "completions", "bash"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("_wasm"),
+        "Expected bash completion function"
+    );
+}
+
+#[test]
+fn test_completions_zsh() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wasm"))
+        .args(&["self", "completions", "zsh"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("#compdef wasm"),
+        "Expected zsh completion header"
+    );
+}
+
+#[test]
+fn test_completions_fish() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wasm"))
+        .args(&["self", "completions", "fish"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("__fish_wasm"),
+        "Expected fish completion function"
+    );
+}
+
+#[test]
+fn test_completions_invalid_shell() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wasm"))
+        .args(&["self", "completions", "invalid"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(!output.status.success());
+}
+
+// =============================================================================
+// Man Pages Tests
+// =============================================================================
+
+#[test]
+fn test_man_pages_generation() {
+    let output = Command::new(env!("CARGO_BIN_EXE_wasm"))
+        .args(&["self", "man-pages"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "man-pages failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("wasm"),
+        "Expected man page to reference 'wasm'"
+    );
+}
+
+// =============================================================================
 // Color Support Tests
 // =============================================================================
 
