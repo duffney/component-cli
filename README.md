@@ -74,7 +74,7 @@ Commands:
   add       Add a dependency to the manifest without installing it
   install   Install a dependency from an OCI registry
   local     Detect and manage local WASM files
-  registry  Manage Wasm Components and WIT interfaces in OCI registries
+  registry  Manage Wasm Components and WIT types in OCI registries
   self      Configure the `wasm(1)` tool, generate completions, & manage state
   help      Print this message or the help of the given subcommand(s)
 
@@ -92,7 +92,7 @@ Global Options:
 
 Let's use `wasm(1)` to fetch a Wasm Component locally and then run that. First
 we have to setup a manifest and add a place for the downloaded components and
-interfaces to go. To do that run:
+types to go. To do that run:
 
 
 ```bash
