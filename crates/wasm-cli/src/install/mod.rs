@@ -351,11 +351,13 @@ async fn install_one(
     result
 }
 
-/// Move vendored WIT files from the wasm vendor dir into the wit vendor dir.
+/// Unpack vendored WIT `.wasm` binaries into `.wit` text files.
 ///
 /// WIT-only packages (types) are initially stored alongside components in
-/// `vendor/wasm/`. This function moves them to `vendor/wit/` so that
-/// WIT tooling can find them at the conventional location.
+/// `vendor/wasm/`. This function decodes each binary into its textual WIT
+/// representation and writes it to `vendor/wit/` so that WIT tooling can
+/// find them at the conventional location.
+// r[impl install.wit-unpack]
 async fn re_vendor_wit_files(
     result: &InstallResult,
     wit_vendor_dir: &std::path::Path,
@@ -364,11 +366,26 @@ async fn re_vendor_wit_files(
         return Ok(());
     }
     for file in &result.vendored_files {
+        let wasm_bytes = tokio::fs::read(file).await?;
+        let wit_text =
+            wasm_package_manager::types::extract_wit_text(&wasm_bytes).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "'{}' is not a valid WIT package — could not decode binary to WIT text",
+                    file.display()
+                )
+            })?;
+
         if let Some(filename) = file.file_name() {
-            let wit_dest = wit_vendor_dir.join(filename);
+            let wit_dest = wit_vendor_dir.join(filename).with_extension("wit");
             tokio::fs::create_dir_all(wit_vendor_dir).await?;
-            let _ = tokio::fs::remove_file(&wit_dest).await;
-            tokio::fs::rename(file, &wit_dest).await?;
+            tokio::fs::write(&wit_dest, wit_text).await?;
+        }
+
+        // Remove the original binary now that it has been unpacked.
+        match tokio::fs::remove_file(file).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(())
@@ -734,5 +751,146 @@ mod tests {
     #[test]
     fn looks_like_wit_name_rejects_multiple_at() {
         assert!(!looks_like_wit_name("wasi:http@0.2@extra"));
+    }
+
+    /// Build a binary WIT package using `wit-component::encode`.
+    fn build_test_wit_wasm() -> Vec<u8> {
+        use wit_parser::{PackageName, Resolve};
+
+        let mut resolve = Resolve::default();
+        let package = wit_parser::Package {
+            name: PackageName {
+                namespace: "test".to_string(),
+                name: "example".to_string(),
+                version: Some(semver::Version::new(1, 0, 0)),
+            },
+            docs: Default::default(),
+            interfaces: Default::default(),
+            worlds: Default::default(),
+        };
+        let pkg_id = resolve.packages.alloc(package);
+
+        let iface = wit_parser::Interface {
+            name: Some("greeter".to_string()),
+            docs: Default::default(),
+            types: Default::default(),
+            functions: Default::default(),
+            package: Some(pkg_id),
+            stability: Default::default(),
+            span: Default::default(),
+            clone_of: None,
+        };
+        let iface_id = resolve.interfaces.alloc(iface);
+        resolve.packages[pkg_id]
+            .interfaces
+            .insert("greeter".into(), iface_id);
+
+        wit_component::encode(&resolve, pkg_id).expect("encoding should succeed")
+    }
+
+    // r[verify install.wit-unpack]
+    #[tokio::test]
+    async fn re_vendor_wit_files_unpacks_binary_to_parseable_wit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wasm_dir = tmp.path().join("vendor/wasm");
+        let wit_dir = tmp.path().join("vendor/wit");
+        std::fs::create_dir_all(&wasm_dir).expect("should create wasm vendor dir");
+
+        // Write a binary WIT package into the wasm vendor dir.
+        let wasm_bytes = build_test_wit_wasm();
+        let wasm_path = wasm_dir.join("test__example.wasm");
+        std::fs::write(&wasm_path, &wasm_bytes).expect("should write test .wasm file");
+
+        let result = InstallResult {
+            registry: "ghcr.io".into(),
+            repository: "test/example".into(),
+            tag: Some("v1.0.0".into()),
+            digest: None,
+            package_name: Some("test:example@1.0.0".into()),
+            oci_title: None,
+            vendored_files: vec![wasm_path.clone()],
+            is_component: false,
+            dependencies: vec![],
+        };
+
+        // Run the function under test.
+        re_vendor_wit_files(&result, &wit_dir)
+            .await
+            .expect("re_vendor should succeed");
+
+        // The original .wasm must have been removed.
+        assert!(
+            !wasm_path.exists(),
+            "original .wasm should be deleted after unpack"
+        );
+
+        // vendor/wit/ must contain exactly one .wit file.
+        let wit_entries: Vec<_> = std::fs::read_dir(&wit_dir)
+            .expect("wit dir should exist")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(wit_entries.len(), 1, "expected exactly one vendored file");
+        let wit_file = &wit_entries[0].path();
+        assert_eq!(
+            wit_file.extension().and_then(|e| e.to_str()),
+            Some("wit"),
+            "vendored file must have .wit extension"
+        );
+
+        // No .wasm files should remain in vendor/wit/.
+        let wasm_in_wit: Vec<_> = std::fs::read_dir(&wit_dir)
+            .expect("should read wit vendor dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "wasm"))
+            .collect();
+        assert!(
+            wasm_in_wit.is_empty(),
+            "no .wasm files should be in vendor/wit/"
+        );
+
+        // The .wit file contents must be valid WIT, parseable by wit-parser.
+        let wit_text = std::fs::read_to_string(wit_file).expect("should read .wit file");
+        let mut resolve = wit_parser::Resolve::default();
+        resolve
+            .push_str(
+                wit_file.to_str().expect("path should be valid UTF-8"),
+                &wit_text,
+            )
+            .expect("vendored .wit file must be valid WIT");
+    }
+
+    #[tokio::test]
+    async fn re_vendor_wit_files_skips_components() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wasm_dir = tmp.path().join("vendor/wasm");
+        let wit_dir = tmp.path().join("vendor/wit");
+        std::fs::create_dir_all(&wasm_dir).expect("should create wasm vendor dir");
+
+        let wasm_path = wasm_dir.join("component.wasm");
+        std::fs::write(&wasm_path, b"irrelevant").expect("should write test .wasm file");
+
+        let result = InstallResult {
+            registry: "ghcr.io".into(),
+            repository: "test/comp".into(),
+            tag: None,
+            digest: None,
+            package_name: None,
+            oci_title: None,
+            vendored_files: vec![wasm_path.clone()],
+            is_component: true,
+            dependencies: vec![],
+        };
+
+        re_vendor_wit_files(&result, &wit_dir)
+            .await
+            .expect("should succeed for component (no-op)");
+
+        // vendor/wit/ should not be created for components.
+        assert!(
+            !wit_dir.exists(),
+            "wit dir should not be created for components"
+        );
+        // Original .wasm should still be present (not moved).
+        assert!(wasm_path.exists(), "component .wasm should be untouched");
     }
 }

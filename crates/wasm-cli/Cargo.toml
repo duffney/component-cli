@@ -56,10 +56,13 @@ hyper = { workspace = true }
 [dev-dependencies]
 insta = { workspace = true }
 oci-client = { workspace = true }
+semver = { workspace = true }
 tempfile = { workspace = true }
 wasm-detector = { workspace = true }
 wasm-encoder = "0.245"
 wasm-package-manager = { workspace = true }
+wit-component = { workspace = true }
+wit-parser = { workspace = true }
 
 [lints]
 workspace = true
