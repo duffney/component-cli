@@ -3,6 +3,8 @@
 mod errors;
 mod progress_bar;
 
+use std::collections::{HashMap, HashSet};
+
 use futures_concurrency::prelude::*;
 use indicatif::MultiProgress;
 use miette::{IntoDiagnostic, WrapErr};
@@ -103,23 +105,37 @@ impl Opts {
 
         let start_time = std::time::Instant::now();
 
-        // Pre-install conflict detection: attempt to resolve dependencies for
-        // each WIT-style manifest entry.  This catches version conflicts and
-        // missing packages *before* any network I/O, so the user gets a clear
-        // error without a partial download.
+        // Pre-install conflict detection + transitive dependency planning.
         //
-        // We only run the resolver for packages that:
-        //   (a) use a WIT-style name as their manifest key, and
-        //   (b) declare a parseable semver version.
-        // Other entries (bare OCI references, etc.) are not checked here —
-        // the sequential install step will surface errors for those.
+        // Collect all WIT-style manifest entries that have parseable semver
+        // versions, then resolve them *all* in a single PubGrub pass via
+        // `resolve_all_dependencies`.  This ensures shared transitive
+        // dependencies are resolved consistently across roots instead of
+        // running separate per-root passes that could produce conflicting
+        // version selections.
         //
-        // A `Db` error from the resolver means dep-graph data is not yet
-        // available for this package (e.g. the meta-registry hasn't indexed
-        // its deps, or the sync was skipped in offline mode). In that case we
-        // skip silently and let the existing sequential installer handle it.
+        // Entries that don't qualify (bare OCI references, unparseable
+        // versions, etc.) are skipped here — a fallback step after the
+        // concurrent batch handles their transitive deps.
+        //
+        // A `Db` error means dep-graph data is not yet available (e.g. the
+        // meta-registry hasn't indexed deps, or sync was skipped in offline
+        // mode).  We skip silently and let the fallback installer handle it.
+        let mut resolved_transitive: HashMap<String, wasm_package_manager::resolver::WitVersion> =
+            HashMap::new();
+        // Track which manifest keys were actually fed into the resolver as
+        // roots.  Used later to build the `planned_packages` set.
+        let mut resolver_root_names: HashSet<String> = HashSet::new();
         if !offline {
-            for (key, dep, _) in manifest.all_dependencies() {
+            let mut roots = Vec::new();
+            for (key, dep, pkg_type) in manifest.all_dependencies() {
+                // Only WIT interface entries are meaningful for the resolver —
+                // component keys (e.g. `root:component`) are unlikely to
+                // exist in the `wit_package` DB and would cause spurious
+                // `NoSolution` errors.
+                if pkg_type != wasm_manifest::PackageType::Interface {
+                    continue;
+                }
                 let version_str = match dep {
                     wasm_manifest::Dependency::Compact(s)
                         if looks_like_wit_name(key) && !s.contains('/') =>
@@ -134,12 +150,26 @@ impl Opts {
                 else {
                     continue;
                 };
-                match manager.resolve_dependencies(key, version) {
+                roots.push((key.clone(), version));
+                resolver_root_names.insert(key.clone());
+            }
+
+            if !roots.is_empty() {
+                match manager.resolve_all_dependencies(&roots) {
+                    Ok(deps) => {
+                        resolved_transitive = deps;
+                    }
                     Err(ResolveError::NoSolution(msg)) => {
                         return Err(InstallError::DependencyConflict(msg).into());
                     }
-                    Ok(_) | Err(ResolveError::Db(_)) => {} // dep data not yet available; skip
+                    Err(ResolveError::Db(_)) => {} // dep data not yet available; skip
                 }
+            }
+
+            // Remove top-level manifest entries — they are installed as part
+            // of the main install batch, not as transitive dependencies.
+            for (key, _, _) in manifest.all_dependencies() {
+                resolved_transitive.remove(key);
             }
         }
 
@@ -174,148 +204,156 @@ impl Opts {
         // the reference without requiring Arc or any synchronisation primitive.
         let manager_ref: &Manager = &manager;
 
-        // Run all installs concurrently.
-        let results: anyhow::Result<Vec<_>> = to_install
+        // Build a unified install list: top-level packages from the manifest
+        // plus transitive dependencies discovered by the resolver.  Transitive
+        // entries that are already in the lockfile are skipped to avoid
+        // redundant downloads.
+        let existing_interface_names: HashSet<_> =
+            lockfile.interfaces.iter().map(|p| p.name.clone()).collect();
+        let transitive_installs: Vec<PlannedInstall> = resolved_transitive
+            .into_iter()
+            .filter(|(name, _)| !existing_interface_names.contains(name))
+            .filter_map(|(name, version)| {
+                let dep = DependencyItem {
+                    package: name.clone(),
+                    version: Some(version.to_string()),
+                };
+                resolve_dep_reference(&manager, &dep).map(|r| PlannedInstall::Transitive {
+                    reference: r,
+                    package_name: name,
+                })
+            })
+            .collect();
+
+        // Derive the set of all WIT package names being installed in the
+        // concurrent batch — both top-level resolver roots and transitive.
+        // This ensures the fallback path does not sequentially re-install a
+        // dep that is already enqueued in the concurrent batch (e.g. a
+        // package that is both a top-level dep and a transitive dep of
+        // another top-level).
+        //
+        // Only the actual resolver roots are included (not all manifest
+        // keys), so component entries and entries that didn't qualify for
+        // the resolver are correctly left out and can fall through to the
+        // sequential fallback.
+        let planned_packages: HashSet<String> = {
+            let transitive_names = transitive_installs.iter().filter_map(|entry| match entry {
+                PlannedInstall::Transitive { package_name, .. } => Some(package_name.clone()),
+                PlannedInstall::TopLevel { .. } => None,
+            });
+            transitive_names.chain(resolver_root_names).collect()
+        };
+
+        let all_installs: Vec<PlannedInstall> = to_install
+            .into_iter()
+            .map(
+                |(reference, update_manifest, explicit_name)| PlannedInstall::TopLevel {
+                    reference,
+                    update_manifest,
+                    explicit_name,
+                },
+            )
+            .chain(transitive_installs)
+            .collect();
+
+        // Run all installs (top-level + transitive) concurrently.
+        // Top-level failures are fatal; transitive failures are logged and
+        // skipped to preserve the soft-failure semantics of the old
+        // sequential installer.
+        let results: anyhow::Result<Vec<Option<(InstallResult, PlannedInstall)>>> = all_installs
             .into_co_stream()
-            .map(|(reference, update_manifest, explicit_name)| {
+            .map(|entry| {
                 let tree = SharedTree::clone(&tree);
                 let vendor_dir = wasm_vendor_dir.clone();
                 let wit_vendor_dir = wit_vendor_dir.clone();
                 async move {
-                    let (name, version) =
-                        package_display_parts(explicit_name.as_deref(), reference.tag());
-                    let display_name = if name.is_empty() {
-                        oci_repo_display_name(reference.repository())
-                    } else {
-                        name
-                    };
-                    let result = install_one(
+                    let (display_name, version) = entry.display_info();
+                    let install_result = install_one(
                         manager_ref,
                         &tree,
                         offline,
-                        &reference,
+                        entry.reference(),
                         &vendor_dir,
                         &display_name,
                         version.as_deref(),
                     )
-                    .await?;
-                    re_vendor_wit_files(&result, &wit_vendor_dir).await?;
-                    anyhow::Ok((result, reference, update_manifest, explicit_name))
+                    .await;
+
+                    match install_result {
+                        Ok(result) => {
+                            if entry.is_transitive() {
+                                if let Err(e) = re_vendor_wit_files(&result, &wit_vendor_dir).await
+                                {
+                                    tracing::debug!(
+                                        "Failed to vendor WIT files for '{}': {e} — skipping",
+                                        display_name,
+                                    );
+                                }
+                            } else {
+                                re_vendor_wit_files(&result, &wit_vendor_dir).await?;
+                            }
+                            anyhow::Ok(Some((result, entry)))
+                        }
+                        Err(e) if entry.is_transitive() => {
+                            tracing::debug!(
+                                "Failed to install transitive dependency '{}': {e} — skipping",
+                                display_name,
+                            );
+                            anyhow::Ok(None)
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
             })
             .collect()
             .await;
 
-        for (result, _reference, update_manifest, explicit_name) in
-            results.map_err(crate::util::into_miette)?
+        // Process results — top-level entries update the manifest and
+        // lockfile; transitive entries only update the lockfile.
+        for (result, entry) in results
+            .map_err(crate::util::into_miette)?
+            .into_iter()
+            .flatten()
         {
-            // Derive the dependency name.
-            // When the user provided an explicit WIT-style name (e.g.
-            // `ba:sample-wasi-http-rust`), use that directly — the embedded
-            // WIT metadata may contain a placeholder like `root:component`.
-            // Otherwise, for components use `derive_component_name` which
-            // tries WIT metadata, OCI title, last repository segment, then
-            // full path.  For interfaces, use the WIT package name.
-            let dep_name = if let Some(name) = explicit_name {
-                name
-            } else if result.is_component {
-                let existing_names: std::collections::HashSet<String> = manifest
-                    .dependencies
-                    .components
-                    .keys()
-                    .chain(manifest.dependencies.interfaces.keys())
-                    .cloned()
-                    .collect();
-                derive_component_name(
-                    result.package_name.as_deref(),
-                    result.oci_title.as_deref(),
-                    &result.repository,
-                    &existing_names,
-                )
-            } else {
-                result.package_name.as_deref().map_or_else(
-                    || format!("{}/{}", result.registry, result.repository),
-                    |name| name.split('@').next().unwrap_or(name).to_string(),
-                )
-            };
+            match entry {
+                PlannedInstall::TopLevel {
+                    update_manifest,
+                    explicit_name,
+                    ..
+                } => {
+                    let dependencies = process_top_level_result(
+                        result,
+                        update_manifest,
+                        explicit_name,
+                        &mut manifest,
+                        &mut lockfile,
+                    );
 
-            // Determine the version from the tag
-            let version = result.tag.clone().unwrap_or_default();
-
-            // Add to manifest (compact format) — route to components or interfaces.
-            // Only update the manifest when a reference was explicitly provided;
-            // for the 0-args case the entries are already in the manifest.
-            // The compact format stores the resolved version string (not the
-            // full OCI reference), so bare "1.2.3" means ^1.2.3 per Cargo
-            // semantics.
-            if update_manifest {
-                let dep = wasm_manifest::Dependency::Compact(version.clone());
-                if result.is_component {
-                    manifest
-                        .dependencies
-                        .components
-                        .insert(dep_name.clone(), dep);
-                } else {
-                    manifest
-                        .dependencies
-                        .interfaces
-                        .insert(dep_name.clone(), dep);
+                    // Fallback: install any transitive deps that were not
+                    // part of the upfront plan (e.g. deps of bare OCI refs
+                    // or packages not yet indexed by the meta-registry).
+                    if !offline {
+                        let unplanned: Vec<DependencyItem> = dependencies
+                            .into_iter()
+                            .filter(|d| !planned_packages.contains(&d.package))
+                            .collect();
+                        if !unplanned.is_empty() {
+                            install_transitive_deps(
+                                unplanned,
+                                manager_ref,
+                                &tree,
+                                &wasm_vendor_dir,
+                                &wit_vendor_dir,
+                                &mut lockfile,
+                            )
+                            .await
+                            .map_err(crate::util::into_miette)?;
+                        }
+                    }
                 }
-            }
-
-            // Build lockfile dependencies from WIT metadata.
-            // Only include dependencies that have a resolved version.
-            // Registry and digest are left empty here and resolved later
-            // by `Lockfile::resolve_dependency_details()` once all transitive
-            // dependencies have been installed.
-            let lockfile_deps: Vec<wasm_manifest::PackageDependency> = result
-                .dependencies
-                .iter()
-                .filter_map(|d| {
-                    d.version
-                        .clone()
-                        .map(|version| wasm_manifest::PackageDependency {
-                            name: d.package.clone(),
-                            version,
-                            registry: String::new(),
-                            digest: String::new(),
-                        })
-                })
-                .collect();
-
-            // Add to lockfile — route to components or interfaces
-            let registry_path = format!("{}/{}", result.registry, result.repository);
-            let digest = result.digest.unwrap_or_default();
-
-            let package = wasm_manifest::Package {
-                name: dep_name.clone(),
-                version,
-                registry: registry_path.clone(),
-                digest,
-                dependencies: lockfile_deps,
-            };
-
-            upsert_lockfile_package(
-                &mut lockfile,
-                result.is_component,
-                &dep_name,
-                &registry_path,
-                package,
-            );
-
-            // Queue WIT dependencies for recursive installation (transitive deps).
-            // These are only added to the lockfile, not the manifest.
-            if !offline {
-                install_transitive_deps(
-                    result.dependencies,
-                    manager_ref,
-                    &tree,
-                    &wasm_vendor_dir,
-                    &wit_vendor_dir,
-                    &mut lockfile,
-                )
-                .await
-                .map_err(crate::util::into_miette)?;
+                PlannedInstall::Transitive { .. } => {
+                    upsert_lockfile_type(&mut lockfile, &result);
+                }
             }
         }
 
@@ -350,6 +388,70 @@ impl Opts {
 
 /// Shared handle to a [`ProgressTree`] for use across concurrent tasks.
 type SharedTree = std::sync::Arc<tokio::sync::Mutex<ProgressTree>>;
+
+/// A package planned for installation, tagged as either a top-level
+/// manifest dependency or a transitive dependency discovered by the
+/// PubGrub resolver.
+enum PlannedInstall {
+    /// A top-level dependency from the manifest or user input.
+    TopLevel {
+        reference: Reference,
+        update_manifest: bool,
+        explicit_name: Option<String>,
+    },
+    /// A transitive dependency discovered by the resolver.
+    Transitive {
+        reference: Reference,
+        package_name: String,
+    },
+}
+
+impl PlannedInstall {
+    /// Returns a reference to the OCI [`Reference`] for this entry.
+    fn reference(&self) -> &Reference {
+        match self {
+            PlannedInstall::TopLevel { reference, .. }
+            | PlannedInstall::Transitive { reference, .. } => reference,
+        }
+    }
+
+    /// Returns `true` when this entry is a transitive dependency.
+    fn is_transitive(&self) -> bool {
+        matches!(self, PlannedInstall::Transitive { .. })
+    }
+
+    /// Returns a `(display_name, version)` pair for progress display.
+    fn display_info(&self) -> (String, Option<String>) {
+        match self {
+            PlannedInstall::TopLevel {
+                reference,
+                explicit_name,
+                ..
+            } => {
+                let (name, ver) = package_display_parts(explicit_name.as_deref(), reference.tag());
+                let display = if name.is_empty() {
+                    oci_repo_display_name(reference.repository())
+                } else {
+                    name
+                };
+                (display, ver)
+            }
+            PlannedInstall::Transitive {
+                reference,
+                package_name,
+            } => {
+                let (name, ver) =
+                    package_display_parts(Some(package_name.as_str()), reference.tag());
+                let display = if name.is_empty() {
+                    package_name.clone()
+                } else {
+                    name
+                };
+                (display, ver)
+            }
+        }
+    }
+}
 
 /// Install a single package and report progress.
 ///
@@ -402,11 +504,122 @@ async fn install_one(
     result
 }
 
+/// Process a top-level install result: update the manifest (if requested)
+/// and upsert the lockfile entry.  Returns the result's dependency list
+/// so the caller can handle any unplanned transitive deps.
+fn process_top_level_result(
+    result: InstallResult,
+    update_manifest: bool,
+    explicit_name: Option<String>,
+    manifest: &mut wasm_manifest::Manifest,
+    lockfile: &mut wasm_manifest::Lockfile,
+) -> Vec<DependencyItem> {
+    // Derive the dependency name.
+    // When the user provided an explicit WIT-style name (e.g.
+    // `ba:sample-wasi-http-rust`), use that directly — the embedded
+    // WIT metadata may contain a placeholder like `root:component`.
+    // Otherwise, for components use `derive_component_name` which
+    // tries WIT metadata, OCI title, last repository segment, then
+    // full path.  For interfaces, use the WIT package name.
+    let dep_name = if let Some(name) = explicit_name {
+        name
+    } else if result.is_component {
+        let existing_names: HashSet<String> = manifest
+            .dependencies
+            .components
+            .keys()
+            .chain(manifest.dependencies.interfaces.keys())
+            .cloned()
+            .collect();
+        derive_component_name(
+            result.package_name.as_deref(),
+            result.oci_title.as_deref(),
+            &result.repository,
+            &existing_names,
+        )
+    } else {
+        result.package_name.as_deref().map_or_else(
+            || format!("{}/{}", result.registry, result.repository),
+            |name| name.split('@').next().unwrap_or(name).to_string(),
+        )
+    };
+
+    // Determine the version from the tag
+    let version = result.tag.clone().unwrap_or_default();
+
+    // Add to manifest (compact format) — route to components or interfaces.
+    // Only update the manifest when a reference was explicitly provided;
+    // for the 0-args case the entries are already in the manifest.
+    // The compact format stores the resolved version string (not the
+    // full OCI reference), so bare "1.2.3" means ^1.2.3 per Cargo
+    // semantics.
+    if update_manifest {
+        let dep = wasm_manifest::Dependency::Compact(version.clone());
+        if result.is_component {
+            manifest
+                .dependencies
+                .components
+                .insert(dep_name.clone(), dep);
+        } else {
+            manifest
+                .dependencies
+                .interfaces
+                .insert(dep_name.clone(), dep);
+        }
+    }
+
+    // Build lockfile dependencies from WIT metadata.
+    // Only include dependencies that have a resolved version.
+    // Registry and digest are left empty here and resolved later
+    // by `Lockfile::resolve_dependency_details()` once all transitive
+    // dependencies have been installed.
+    let lockfile_deps: Vec<wasm_manifest::PackageDependency> = result
+        .dependencies
+        .iter()
+        .filter_map(|d| {
+            d.version
+                .clone()
+                .map(|version| wasm_manifest::PackageDependency {
+                    name: d.package.clone(),
+                    version,
+                    registry: String::new(),
+                    digest: String::new(),
+                })
+        })
+        .collect();
+
+    // Add to lockfile — route to components or interfaces
+    let registry_path = format!("{}/{}", result.registry, result.repository);
+    let digest = result.digest.unwrap_or_default();
+
+    let package = wasm_manifest::Package {
+        name: dep_name.clone(),
+        version,
+        registry: registry_path.clone(),
+        digest,
+        dependencies: lockfile_deps,
+    };
+
+    upsert_lockfile_package(
+        lockfile,
+        result.is_component,
+        &dep_name,
+        &registry_path,
+        package,
+    );
+
+    result.dependencies
+}
+
 /// Recursively install transitive WIT dependencies of a component.
 ///
-/// Uses a work queue and visited set to avoid cycles and duplicates.
-/// Each resolved dependency is installed, vendored to `wit/`, and added
-/// to `lockfile.interfaces`. The manifest is **not** modified.
+/// Installs each wave of dependencies concurrently and then collects
+/// their transitive deps for the next wave. This is a breadth-first
+/// traversal where each level is installed as a concurrent batch.
+///
+/// A visited set prevents cycles and duplicates, and lockfile-present
+/// entries are skipped.  Failures are logged and skipped — the manifest
+/// is **not** modified.
 async fn install_transitive_deps(
     initial_deps: Vec<DependencyItem>,
     manager: &Manager,
@@ -415,67 +628,92 @@ async fn install_transitive_deps(
     wit_vendor_dir: &std::path::Path,
     lockfile: &mut wasm_manifest::Lockfile,
 ) -> anyhow::Result<()> {
-    let mut work_queue = std::collections::VecDeque::from(initial_deps);
-    let mut visited: std::collections::HashSet<(String, Option<String>)> =
-        std::collections::HashSet::new();
+    let mut current_wave = initial_deps;
+    let mut visited: HashSet<(String, Option<String>)> = HashSet::new();
 
-    while let Some(dep) = work_queue.pop_front() {
-        let dep_key = (dep.package.clone(), dep.version.clone());
-        // `insert` returns `false` when the key was already present
-        if !visited.insert(dep_key) {
-            continue;
+    while !current_wave.is_empty() {
+        // Build a set of lockfile interface names for O(1) lookups.
+        let lockfile_names: HashSet<&str> = lockfile
+            .interfaces
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+
+        // Deduplicate and filter the current wave, collecting
+        // installable entries.
+        let wave_entries: Vec<(DependencyItem, Reference, String, Option<String>)> = current_wave
+            .into_iter()
+            .filter(|dep| {
+                let dep_key = (dep.package.clone(), dep.version.clone());
+                visited.insert(dep_key)
+            })
+            .filter(|dep| !lockfile_names.contains(dep.package.as_str()))
+            .filter_map(|dep| {
+                let dep_ref = resolve_dep_reference(manager, &dep)?;
+                let (name, version) = package_display_parts(Some(&dep.package), dep_ref.tag());
+                let display_name = if name.is_empty() {
+                    dep.package.clone()
+                } else {
+                    name
+                };
+                Some((dep, dep_ref, display_name, version))
+            })
+            .collect();
+
+        if wave_entries.is_empty() {
+            break;
         }
 
-        // Skip if already present in the lockfile
-        if lockfile.interfaces.iter().any(|p| p.name == dep.package) {
-            continue;
+        // Install all entries in this wave concurrently.
+        let results: Vec<Option<InstallResult>> = wave_entries
+            .into_co_stream()
+            .map(|(dep, dep_ref, display_name, version)| {
+                let tree = SharedTree::clone(tree);
+                let vendor_dir = wasm_vendor_dir.to_path_buf();
+                let wit_dir = wit_vendor_dir.to_path_buf();
+                async move {
+                    let dep_result = match install_one(
+                        manager,
+                        &tree,
+                        false,
+                        &dep_ref,
+                        &vendor_dir,
+                        &display_name,
+                        version.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::debug!(
+                                "Failed to install WIT dependency '{}': {e} — skipping",
+                                dep.package,
+                            );
+                            return None;
+                        }
+                    };
+
+                    if let Err(e) = re_vendor_wit_files(&dep_result, &wit_dir).await {
+                        tracing::debug!(
+                            "Failed to vendor WIT files for '{}': {e} — skipping",
+                            dep.package,
+                        );
+                    }
+
+                    Some(dep_result)
+                }
+            })
+            .collect()
+            .await;
+
+        // Process results: update lockfile and collect next-wave deps.
+        let mut next_wave = Vec::new();
+        for result in results.into_iter().flatten() {
+            upsert_lockfile_type(lockfile, &result);
+            next_wave.extend(result.dependencies);
         }
 
-        let Some(dep_ref) = resolve_dep_reference(manager, &dep) else {
-            continue;
-        };
-
-        let (name, version) = package_display_parts(Some(&dep.package), dep_ref.tag());
-        let display_name = if name.is_empty() {
-            dep.package.clone()
-        } else {
-            name
-        };
-
-        let dep_result = match install_one(
-            manager,
-            tree,
-            false,
-            &dep_ref,
-            wasm_vendor_dir,
-            &display_name,
-            version.as_deref(),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(
-                    "Failed to install WIT dependency '{}': {e} — skipping",
-                    dep.package,
-                );
-                continue;
-            }
-        };
-
-        if let Err(e) = re_vendor_wit_files(&dep_result, wit_vendor_dir).await {
-            tracing::debug!(
-                "Failed to vendor WIT files for '{}': {e} — skipping",
-                dep.package,
-            );
-        }
-
-        upsert_lockfile_type(lockfile, &dep_result);
-
-        // Queue transitive dependencies (consuming dep_result.dependencies)
-        for transitive_dep in dep_result.dependencies {
-            work_queue.push_back(transitive_dep);
-        }
+        current_wave = next_wave;
     }
 
     Ok(())
@@ -660,5 +898,58 @@ mod tests {
         );
         // Original .wasm should still be present (not moved).
         assert!(wasm_path.exists(), "component .wasm should be untouched");
+    }
+
+    #[test]
+    fn planned_packages_includes_resolver_roots_and_enqueued_transitive() {
+        use super::PlannedInstall;
+        use std::collections::HashSet;
+
+        // Simulate: the resolver returned two transitive deps (wasi:io and
+        // wasi:cli), but only wasi:io survived filtering (e.g. wasi:cli was
+        // already in the lockfile or unresolvable via OCI).  Only actual
+        // resolver roots (interface keys that went through the resolver) are
+        // included in the planned set — component keys and entries that
+        // didn't qualify are excluded so they correctly fall through to the
+        // sequential fallback.
+        let transitive_installs = vec![PlannedInstall::Transitive {
+            reference: "ghcr.io/test/wasi-io:0.2.0"
+                .parse()
+                .expect("valid reference"),
+            package_name: "wasi:io".to_string(),
+        }];
+
+        // This mirrors the derivation in Opts::run: transitive names from
+        // the actual install vec, plus only the resolver root names (not
+        // all manifest keys).
+        let resolver_root_names: HashSet<String> = HashSet::from(["wasi:http".to_string()]);
+        let planned: HashSet<String> = {
+            let transitive_names = transitive_installs.iter().filter_map(|entry| match entry {
+                PlannedInstall::Transitive { package_name, .. } => Some(package_name.clone()),
+                PlannedInstall::TopLevel { .. } => None,
+            });
+            transitive_names.chain(resolver_root_names).collect()
+        };
+
+        // "wasi:io" was actually enqueued as transitive → in planned set.
+        assert!(planned.contains("wasi:io"));
+        // "wasi:http" is a resolver root → in planned set.
+        assert!(
+            planned.contains("wasi:http"),
+            "resolver root names should appear in planned set"
+        );
+        // "wasi:cli" was resolved but not enqueued → absent from planned,
+        // so the fallback installer handles it.
+        assert!(
+            !planned.contains("wasi:cli"),
+            "only enqueued deps should appear in planned set"
+        );
+        // Component keys (e.g. "root:component") that didn't go through the
+        // resolver are absent from planned so their transitive deps are
+        // handled by the sequential fallback.
+        assert!(
+            !planned.contains("root:component"),
+            "component keys should not appear in planned set"
+        );
     }
 }
