@@ -30,21 +30,8 @@ fn render_packages(packages: &[KnownPackage]) -> String {
     body.push(render_hero(packages.len()));
 
     // Package sections with generous separation
-    if let Some(section) = render_section("Interfaces", &interfaces) {
-        body.push(section);
-    }
-    if let Some(section) = render_section("Components", &components) {
-        body.push(section);
-    }
-
-    if packages.is_empty() {
-        body.division(|div| {
-            div.class("py-16 text-center").paragraph(|p| {
-                p.class("text-fg-muted")
-                    .text("No packages found. The registry may still be syncing.")
-            })
-        });
-    }
+    body.push(render_section("Interfaces", &interfaces));
+    body.push(render_section("Components", &components));
 
     layout::document("Home", &body.build().to_string())
 }
@@ -64,50 +51,82 @@ fn render_error(err: &ApiError) -> String {
     layout::document("Home", &body.build().to_string())
 }
 
-/// Render the hero area with title, subtitle, and package count.
+/// Render the hero area with heading, search form, CTA, and quick-install hint.
 fn render_hero(total: usize) -> Division {
+    let placeholder = if total > 0 {
+        format!("Search {total} packages\u{2026}")
+    } else {
+        "Search packages\u{2026}".to_owned()
+    };
+
     let mut hero = Division::builder();
-    hero.class("pb-12 border-b border-border mb-12");
+    hero.class("pt-8 pb-16 mb-10");
+
+    // Title and hint — grouped tightly
     hero.heading_1(|h1| {
         h1.class("text-3xl font-bold tracking-tight")
             .text("WebAssembly Package Registry")
     });
     hero.paragraph(|p| {
-        p.class("text-fg-secondary mt-3 max-w-[50ch]")
-            .text("Browse WebAssembly components and WIT interfaces published to OCI registries.")
+        p.class("mt-2 text-sm text-fg-muted")
+            .text("Get started: ")
+            .code(|code| {
+                code.class(
+                    "font-mono text-fg-secondary bg-surface-muted px-1.5 py-0.5 rounded text-xs",
+                )
+                .text("wasm install wasi:http")
+            })
     });
-    if total > 0 {
-        hero.paragraph(|p| {
-            p.class("text-sm text-fg-faint mt-4")
-                .text(format!("{total} packages indexed"))
-        });
-    }
+
+    // Search and CTA — grouped below with generous separation from title
+    hero.division(|row| {
+        row.class("mt-8 flex flex-col sm:flex-row gap-3 sm:items-center")
+            .form(|form| {
+                form.action("/search")
+                    .method("get")
+                    .class("flex flex-1 max-w-lg")
+                    .input(|input| {
+                        input
+                            .type_("search")
+                            .name("q")
+                            .placeholder(placeholder)
+                            .aria_label("Search packages")
+                            .autofocus(true)
+                            .class("flex-1 px-4 py-2.5 rounded-l-md text-base border border-border bg-surface text-fg placeholder:text-fg-faint focus:border-accent focus:outline-none transition-colors")
+                    })
+                    .button(|btn| {
+                        btn.type_("submit")
+                            .class("px-5 py-2.5 rounded-r-md text-sm font-medium bg-accent text-white hover:bg-accent-hover border border-accent transition-colors")
+                            .text("Search")
+                    })
+            })
+            .anchor(|a| {
+                a.href("/docs")
+                    .class("text-sm text-fg-muted hover:text-accent transition-colors shrink-0")
+                    .text("Publish a component \u{2192}")
+            })
+    });
+
     hero.build()
 }
 
-/// Split packages into (components, interfaces) based on WIT metadata.
+/// Split packages into (components, interfaces) based on package kind.
 fn split_by_kind(packages: &[KnownPackage]) -> (Vec<&KnownPackage>, Vec<&KnownPackage>) {
     let mut components = Vec::new();
     let mut interfaces = Vec::new();
 
     for pkg in packages {
-        // Packages without WIT metadata go into components as a fallback
-        if pkg.wit_namespace.is_none() {
-            components.push(pkg);
-        } else {
-            interfaces.push(pkg);
+        match pkg.kind {
+            Some(wasm_meta_registry_client::PackageKind::Interface) => interfaces.push(pkg),
+            _ => components.push(pkg),
         }
     }
 
     (components, interfaces)
 }
 
-/// Render a section with a heading, a grid of package rows, and a "view all" link.
-fn render_section(heading: &str, packages: &[&KnownPackage]) -> Option<Section> {
-    if packages.is_empty() {
-        return None;
-    }
-
+/// Render a section with a heading, a grid of package cards, and a "view all" link.
+fn render_section(heading: &str, packages: &[&KnownPackage]) -> Section {
     let has_more = packages.len() > HOME_SECTION_LIMIT;
     let visible = packages.get(..HOME_SECTION_LIMIT).unwrap_or(packages);
 
@@ -121,11 +140,11 @@ fn render_section(heading: &str, packages: &[&KnownPackage]) -> Option<Section> 
     };
 
     let mut section = Section::builder();
-    section.class("mb-16");
+    section.class("mb-10");
 
     // Section header with icon, description, and count
     section.division(|div| {
-        div.class("mb-4")
+        div.class("mb-5")
             .division(|row| {
                 row.class("flex items-baseline justify-between")
                     .heading_2(|h2| {
@@ -143,30 +162,38 @@ fn render_section(heading: &str, packages: &[&KnownPackage]) -> Option<Section> 
             })
     });
 
-    // Package list — compact rows instead of card grid
-    let mut list = Division::builder();
-    list.class("divide-y divide-border-light");
-    for pkg in visible {
-        list.push(render_row(pkg));
-    }
-    section.push(list.build());
-
-    // "View all" link
-    if has_more {
+    if packages.is_empty() {
+        // Empty state
         section.paragraph(|p| {
-            p.class("mt-4").anchor(|a| {
-                a.href("/all")
-                    .class("text-sm text-accent hover:underline")
-                    .text(format!("View all {heading} →"))
-            })
+            p.class("py-8 text-sm text-fg-faint")
+                .text(format!("No {heading} found yet."))
         });
+    } else {
+        // Package grid — card layout
+        let mut grid = Division::builder();
+        grid.class("grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4");
+        for pkg in visible {
+            grid.push(render_card(pkg));
+        }
+        section.push(grid.build());
+
+        // "View all" link
+        if has_more {
+            section.paragraph(|p| {
+                p.class("mt-4").anchor(|a| {
+                    a.href("/all")
+                        .class("text-sm text-accent hover:underline")
+                        .text(format!("View all {heading} →"))
+                })
+            });
+        }
     }
 
-    Some(section.build())
+    section.build()
 }
 
-/// Render a single package as a compact row.
-fn render_row(pkg: &KnownPackage) -> Division {
+/// Render a single package as a card.
+fn render_card(pkg: &KnownPackage) -> Division {
     let display_name = match (&pkg.wit_namespace, &pkg.wit_name) {
         (Some(ns), Some(name)) => format!("{ns}:{name}"),
         _ => pkg.repository.clone(),
@@ -184,35 +211,35 @@ fn render_row(pkg: &KnownPackage) -> Division {
             .anchor(|a| {
                 a.href(format!("/{ns}/{name}"))
                     .class(
-                        "flex items-baseline gap-3 py-3 hover:bg-surface -mx-2 px-2 rounded transition-colors",
+                        "block border border-border rounded-lg p-4 hover:border-accent/40 hover:bg-surface transition-colors",
                     )
                     .span(|s| {
-                        s.class("font-semibold text-accent shrink-0")
+                        s.class("block font-semibold text-accent truncate")
                             .text(display_name)
                     })
                     .span(|s| {
-                        s.class("text-sm text-fg-faint shrink-0")
-                            .text(version.to_owned())
+                        s.class("block text-sm text-fg-muted mt-1 line-clamp-2")
+                            .text(description.to_owned())
                     })
                     .span(|s| {
-                        s.class("text-sm text-fg-muted truncate")
-                            .text(description.to_owned())
+                        s.class("block text-xs text-fg-faint mt-3 font-mono")
+                            .text(version.to_owned())
                     })
             })
             .build(),
         _ => Division::builder()
-            .class("flex items-baseline gap-3 py-3 -mx-2 px-2 rounded")
+            .class("border border-border rounded-lg p-4")
             .span(|s| {
-                s.class("font-semibold text-fg shrink-0")
+                s.class("block font-semibold text-fg truncate")
                     .text(display_name)
             })
             .span(|s| {
-                s.class("text-sm text-fg-faint shrink-0")
-                    .text(version.to_owned())
+                s.class("block text-sm text-fg-muted mt-1 line-clamp-2")
+                    .text(description.to_owned())
             })
             .span(|s| {
-                s.class("text-sm text-fg-muted truncate")
-                    .text(description.to_owned())
+                s.class("block text-xs text-fg-faint mt-3 font-mono")
+                    .text(version.to_owned())
             })
             .build(),
     }
@@ -222,18 +249,18 @@ fn render_row(pkg: &KnownPackage) -> Division {
 mod tests {
     use super::*;
 
-    fn package(wit_namespace: Option<&str>) -> KnownPackage {
+    fn package(kind: Option<wasm_meta_registry_client::PackageKind>) -> KnownPackage {
         KnownPackage {
             registry: "ghcr.io".to_string(),
             repository: "example/pkg".to_string(),
-            kind: None,
+            kind,
             description: None,
             tags: vec!["1.0.0".to_string()],
             signature_tags: vec![],
             attestation_tags: vec![],
             last_seen_at: "2026-01-01T00:00:00Z".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
-            wit_namespace: wit_namespace.map(ToOwned::to_owned),
+            wit_namespace: Some("test".to_string()),
             wit_name: Some("demo".to_string()),
             dependencies: vec![],
         }
@@ -241,15 +268,19 @@ mod tests {
 
     // r[verify frontend.pages.home]
     #[test]
-    fn split_by_kind_uses_wit_namespace_presence() {
-        let interface = package(Some("wasi"));
-        let component = package(None);
-        let input = vec![interface, component];
+    fn split_by_kind_uses_package_kind() {
+        use wasm_meta_registry_client::PackageKind;
+
+        let interface = package(Some(PackageKind::Interface));
+        let component = package(Some(PackageKind::Component));
+        let unknown = package(None);
+        let input = vec![interface, component, unknown];
 
         let (components, interfaces) = split_by_kind(&input);
-        assert_eq!(components.len(), 1);
         assert_eq!(interfaces.len(), 1);
-        assert!(components[0].wit_namespace.is_none());
-        assert!(interfaces[0].wit_namespace.is_some());
+        assert_eq!(components.len(), 2);
+        assert_eq!(interfaces[0].kind, Some(PackageKind::Interface));
+        assert_eq!(components[0].kind, Some(PackageKind::Component));
+        assert_eq!(components[1].kind, None);
     }
 }
