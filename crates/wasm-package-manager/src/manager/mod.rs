@@ -625,6 +625,13 @@ impl Manager {
         self.store.delete(&reference).await
     }
 
+    fn with_dependencies(&self, mut pkg: KnownPackage) -> anyhow::Result<KnownPackage> {
+        pkg.dependencies = self
+            .store
+            .get_package_dependencies(&pkg.registry, &pkg.repository)?;
+        Ok(pkg)
+    }
+
     /// Search for known packages by query string.
     /// Searches in both registry and repository fields.
     /// Uses pagination with `offset` and `limit` parameters.
@@ -634,12 +641,11 @@ impl Manager {
         offset: u32,
         limit: u32,
     ) -> anyhow::Result<Vec<KnownPackage>> {
-        Ok(self
-            .store
+        self.store
             .search_known_packages(query, offset, limit)?
             .into_iter()
-            .map(KnownPackage::from)
-            .collect())
+            .map(|raw| self.with_dependencies(KnownPackage::from(raw)))
+            .collect()
     }
 
     /// Search for known packages that import a given interface.
@@ -650,12 +656,11 @@ impl Manager {
         offset: u32,
         limit: u32,
     ) -> anyhow::Result<Vec<KnownPackage>> {
-        Ok(self
-            .store
+        self.store
             .search_known_packages_by_import(interface, offset, limit)?
             .into_iter()
-            .map(KnownPackage::from)
-            .collect())
+            .map(|raw| self.with_dependencies(KnownPackage::from(raw)))
+            .collect()
     }
 
     /// Search for known packages that export a given interface.
@@ -666,12 +671,11 @@ impl Manager {
         offset: u32,
         limit: u32,
     ) -> anyhow::Result<Vec<KnownPackage>> {
-        Ok(self
-            .store
+        self.store
             .search_known_packages_by_export(interface, offset, limit)?
             .into_iter()
-            .map(KnownPackage::from)
-            .collect())
+            .map(|raw| self.with_dependencies(KnownPackage::from(raw)))
+            .collect()
     }
 
     /// Get all known packages.

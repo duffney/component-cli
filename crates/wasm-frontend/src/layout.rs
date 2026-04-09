@@ -36,7 +36,7 @@ pub(crate) fn document(title: &str, body_content: &str) -> String {
 
     format!(
         r#"<!DOCTYPE html>
-<html lang="en">
+<html lang="en" style="view-transition-name:root">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -115,6 +115,19 @@ pub(crate) fn document(title: &str, body_content: &str) -> String {
     :focus:not(:focus-visible) {{
       outline: none;
     }}
+    @view-transition {{
+      navigation: auto;
+    }}
+    ::view-transition-old(root),
+    ::view-transition-new(root) {{
+      animation-duration: 0s;
+    }}
+    @media (prefers-reduced-motion: reduce) {{
+      ::view-transition-old(root),
+      ::view-transition-new(root) {{
+        animation: none;
+      }}
+    }}
   </style>
 </head>
 <body class="bg-page text-fg min-h-screen flex flex-col leading-relaxed">
@@ -161,7 +174,7 @@ mod tests {
     #[test]
     fn document_includes_expected_rendering_and_styling_primitives() {
         let html = document("Home", "<p>Body</p>");
-        assert!(html.contains("<html lang=\"en\">"));
+        assert!(html.contains("<html lang=\"en\""));
         assert!(html.contains("https://cdn.tailwindcss.com"));
         assert!(html.contains(ACCENT_COLOR));
         assert!(html.contains("<meta name=\"viewport\""));

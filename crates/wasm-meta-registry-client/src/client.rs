@@ -201,7 +201,7 @@ impl RegistryClient {
         repository: &str,
     ) -> Result<Option<PackageDetail>, ApiError> {
         let encoded_reg = percent_encode_query_component(registry);
-        let encoded_repo = percent_encode_query_component(repository);
+        let encoded_repo = percent_encode_path_component(repository);
         let url = format!(
             "{}/v1/packages/detail/{encoded_reg}/{encoded_repo}",
             self.base_url
@@ -217,7 +217,7 @@ impl RegistryClient {
         repository: &str,
     ) -> Result<Vec<PackageVersion>, ApiError> {
         let encoded_reg = percent_encode_query_component(registry);
-        let encoded_repo = percent_encode_query_component(repository);
+        let encoded_repo = percent_encode_path_component(repository);
         let url = format!(
             "{}/v1/packages/versions/{encoded_reg}/{encoded_repo}",
             self.base_url
@@ -234,7 +234,7 @@ impl RegistryClient {
         version: &str,
     ) -> Result<Option<PackageVersion>, ApiError> {
         let encoded_reg = percent_encode_query_component(registry);
-        let encoded_repo = percent_encode_query_component(repository);
+        let encoded_repo = percent_encode_path_component(repository);
         let encoded_ver = percent_encode_query_component(version);
         let url = format!(
             "{}/v1/packages/version/{encoded_reg}/{encoded_ver}/{encoded_repo}",
@@ -534,6 +534,22 @@ fn percent_encode_query_component(input: &str) -> String {
     encoded
 }
 
+/// Percent-encode a path component, preserving forward slashes for catch-all
+/// route segments (e.g. `{*repository}`).
+#[must_use]
+fn percent_encode_path_component(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +573,19 @@ mod tests {
         assert_eq!(
             percent_encode_query_component(query),
             "name%20with%20spaces%20%26%20%3F%20%2F"
+        );
+    }
+
+    #[test]
+    fn percent_encoding_path_component_preserves_slashes_and_encodes_reserved_chars() {
+        assert_eq!(percent_encode_path_component("user/repo"), "user/repo");
+        assert_eq!(
+            percent_encode_path_component("user name/repo?frag#v1"),
+            "user%20name/repo%3Ffrag%23v1"
+        );
+        assert_eq!(
+            percent_encode_path_component("percent%tag"),
+            "percent%25tag"
         );
     }
 
