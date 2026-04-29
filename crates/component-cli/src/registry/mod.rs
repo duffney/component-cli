@@ -19,7 +19,6 @@ pub(crate) enum Opts {
     Show,
     /// Pull a component from the registry
     Pull(PullOpts),
-    Push,
     /// List all available tags for a component
     Tags(TagsOpts),
     /// Search for packages across configured registries
@@ -94,7 +93,6 @@ impl Opts {
                 }
                 Ok(())
             }
-            Opts::Push => todo!(),
             Opts::Tags(opts) => {
                 let all_tags = store.list_tags(&opts.reference).await?;
 

@@ -1577,6 +1577,53 @@ impl Manager {
             .follow_symlinks(follow_symlinks);
         detector.into_iter().filter_map(Result::ok).collect()
     }
+
+    /// Build a [`crate::publish::PublishPlan`] for the given manifest
+    /// without performing any network I/O.
+    ///
+    /// This is what `component publish --dry-run` calls; it loads the
+    /// component file from disk (or builds the WIT package), constructs
+    /// the OCI annotations, and computes the target reference, but does
+    /// not contact the registry.
+    pub async fn publish_dry_run(
+        &self,
+        manifest: &component_manifest::Manifest,
+        manifest_dir: &Path,
+    ) -> anyhow::Result<crate::publish::PublishPlan> {
+        crate::publish::plan(manifest, manifest_dir).await
+    }
+
+    /// Publish the artifact described by `manifest` to an OCI registry.
+    ///
+    /// Components are pushed as-is; WIT interfaces are first packaged
+    /// via [`crate::publish::build_wit_package`] (which stamps the
+    /// manifest version onto the WIT package decl).
+    ///
+    /// The target registry comes from the manifest's
+    /// `[package].registry_ref` field — there is no implicit default.
+    pub async fn publish(
+        &self,
+        manifest: &component_manifest::Manifest,
+        manifest_dir: &Path,
+    ) -> anyhow::Result<crate::publish::PublishPlan> {
+        if self.offline {
+            anyhow::bail!("cannot publish in offline mode");
+        }
+        let mut plan = crate::publish::plan(manifest, manifest_dir).await?;
+        let bytes = std::mem::take(&mut plan.bytes);
+        let annotations = std::mem::take(&mut plan.annotations);
+        let _response = self
+            .client
+            .push(&plan.reference, bytes, annotations)
+            .await?;
+
+        // NOTE: locally recording the freshly-published tag (so
+        // `component registry tags` reflects it without a registry
+        // round-trip) is a future enhancement. For now the registry is
+        // the canonical source — the next `tags` call will refetch it.
+        tracing::debug!(reference = %plan.reference, "published artifact");
+        Ok(plan)
+    }
 }
 
 /// Check whether an `anyhow::Error` wraps an OCI "manifest unknown" error.
