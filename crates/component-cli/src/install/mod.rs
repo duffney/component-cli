@@ -208,6 +208,9 @@ impl Opts {
                         return Err(InstallError::DependencyConflict(msg).into());
                     }
                     Err(ResolveError::Db(_)) => {} // dep data not yet available; skip
+                    Err(ResolveError::NoRuntime(msg)) => {
+                        return Err(InstallError::DependencyConflict(msg).into());
+                    }
                 }
             }
 
@@ -591,7 +594,7 @@ fn process_top_level_result(
     let registry_path = format!("{}/{}", result.registry, result.repository);
     let digest = result.digest.unwrap_or_default();
 
-    let package = component_manifest::Package {
+    let package = component_manifest::LockedPackage {
         name: dep_name.clone(),
         version,
         registry: registry_path.clone(),

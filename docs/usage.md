@@ -56,15 +56,75 @@ component package pull registry.example.com/org/component:tag
 
 The package is stored locally in content-addressable storage and can be listed with `component package list`.
 
-### Pushing Packages
+### Publishing a Package
 
-Push a local package to a registry:
+`component publish` reads a `[package]` section from `wasm.toml` and
+uploads either the compiled component (`kind = "component"`) or a
+freshly-built WIT package (`kind = "interface"`). The target reference
+**must** be spelled out in full in the manifest — there is no implicit
+default and no shorthand — so publishing is fully reproducible from
+`wasm.toml` alone.
 
-```bash
-component package push ghcr.io/myuser/my-component:v1.0.0
+```toml
+# wasm.toml
+[package]
+# Package identity in `namespace:name` form. Used as the OCI artifact
+# title and (for interfaces) stamped onto WIT package decls.
+name = "yoshuawuyts:fetch"
+# Semver version. The single source of truth: WIT files must not
+# declare their own `@version` — the publisher stamps this onto every
+# top-level `package` decl during build. Becomes the OCI tag.
+version = "0.1.0"
+# Fully-formed OCI repository reference (host + path), without a tag.
+# The published reference is `<registry_ref>:<version>`.
+registry_ref = "ghcr.io/yoshuawuyts/fetch"
+# What kind of artifact this manifest publishes: "component" or "interface".
+kind = "component"
+# Path to the compiled component, relative to the manifest directory.
+# Defaults to `build/<name-after-colon>.wasm` if omitted.
+file = "build/fetch.wasm"
+# Free-form metadata, mapped to `org.opencontainers.image.*` annotations.
+description = "A tiny fetch helper"
+license = "Apache-2.0"
+authors = ["Yosh <yosh@example.com>"]
 ```
 
+For an interface package, point `wit` at the WIT directory:
+
+```toml
+[package]
+name = "wasi:logging"
+version = "1.0.0"
+registry_ref = "ghcr.io/wasi/logging"
+kind = "interface"
+# Path to the WIT directory, relative to the manifest. Defaults to "wit".
+wit = "wit"
+```
+
+The manifest's `version` is the **single source of truth** — WIT files
+must not declare their own `@version`; the publisher will stamp the
+manifest version onto every top-level `package` decl during build.
+
+Inspect what would be published without pushing:
+
+```bash
+component publish --dry-run
+```
+
+Publish for real:
+
+```bash
+component publish                       # uses [package].registry_ref
+component publish --file build/x.wasm   # override the artifact path
+```
+
+The artifact is uploaded as a single OCI layer
+(`application/vnd.wasm.config.v0+json` config, `application/wasm`
+layer) with `org.opencontainers.image.{title,version,created,description,source,url,documentation,licenses,authors}`
+annotations populated from the `[package]` section.
+
 **Note**: You must be authenticated to push packages. See [Authentication](authentication.md) for details.
+
 
 ### Listing Packages
 
@@ -176,6 +236,84 @@ This operation:
 1. Run `component self state` to check storage usage
 2. Remove unused packages manually or with future commands
 3. Run `component self clean` to reclaim space
+
+## Running Library-style Components
+
+`component run` can execute three kinds of WebAssembly components:
+
+- **HTTP components** (export `wasi:http/incoming-handler`) are
+  served on a local TCP port — use `--listen` to set the address.
+- **CLI components** (export `wasi:cli/run`) are executed as
+  programs; trailing arguments after `<INPUT>` become the guest's
+  `argv`.
+- **Library-style components** — anything that exports plain
+  functions or interfaces but does not target either of the worlds
+  above. The component's WIT exports are translated into a `clap`
+  sub-CLI on the fly.
+
+The WIT → CLI mapping is implemented by the
+[`wit2cli`](../crates/wit2cli) crate. Its
+[`tests/snapshots/`](../crates/wit2cli/tests/snapshots) directory
+contains the canonical, end-user-facing spec for how each WIT type
+translates into a CLI argument — one snapshot per shipped fixture.
+
+### A worked example
+
+Given a component with this WIT:
+
+```wit
+package yoshuawuyts:wordmark;
+
+world wordmark {
+    /// Convert a markdown document to a Word (.docx) document.
+    export to-word: func(markdown: string) -> result<list<u8>, string>;
+}
+```
+
+You can invoke it directly:
+
+```bash
+component run yoshuawuyts:wordmark to-word "# hello" > file.docx
+```
+
+This dispatches to the `to-word` export, passes `"# hello"` as the
+single string parameter, and writes the resulting bytes verbatim to
+stdout (or, with redirection, to `file.docx`).
+
+### Argument mapping
+
+| WIT type | CLI shape |
+|----------|-----------|
+| Primitives, `string`, `char`, `enum`, `variant` | Positional argument |
+| `record` | Group of `--field-name VALUE` flags. With multiple record params, fields are prefixed: `--<param>-<field>` |
+| `list<T>` | Repeated `--name V --name W`, or positional variadic when last |
+| `option<T>` | Same as `T`, but optional |
+| `variant V(payload)` | `name=value` for cases with a payload, `name` otherwise |
+
+Resources and futures/streams are not supported.
+
+### Output rules
+
+- `list<u8>` results are written to stdout as raw bytes (this is
+  what makes `> file.docx` work).
+- `string` results are written verbatim with no trailing newline.
+- Numeric / boolean / `char` results are rendered with `Display` and
+  a trailing newline.
+- Records, variants, enums, flags, tuples, and lists of non-`u8`
+  are rendered as JSON.
+- A `result::Err(e)` causes `component run` to print `e` to stderr
+  and exit with code 1.
+
+### Host flags vs. guest arguments
+
+All host-side flags (`--global`, `--env`, `--dir`, `--inherit-env`,
+`--inherit-network`, `--no-stdio`, `--listen`) must come **before**
+the `<INPUT>` argument; everything after `<INPUT>` is forwarded to
+the guest:
+
+```bash
+component run --inherit-env yoshuawuyts:wordmark to-word "# hi"
+```
 
 ## Package Reference Format
 

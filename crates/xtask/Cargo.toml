@@ -13,6 +13,8 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 sea-orm = { workspace = true }
 component-package-manager-migration = { workspace = true }
+wit-component = { workspace = true }
+wit-parser = { workspace = true }
 
 [lints]
 workspace = true
