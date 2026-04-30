@@ -1161,6 +1161,16 @@ impl Store {
         Ok(Self { state_info, db })
     }
 
+    /// Test-only accessor for the underlying SeaORM database connection.
+    ///
+    /// Used by sibling test modules (e.g. the resolver smoke tests) that
+    /// need to seed entity rows directly without going through the
+    /// still-stubbed high-level insert APIs.
+    #[cfg(test)]
+    pub(crate) fn db(&self) -> &DatabaseConnection {
+        &self.db
+    }
+
     // ---- TODO: methods below are stubbed; will be filled in incrementally.
 
     /// Extract WIT metadata from wasm bytes and persist the resulting

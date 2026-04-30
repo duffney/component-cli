@@ -56,7 +56,10 @@ The schema is defined as Rust SeaORM migrations under
 
 Run `cargo xtask sql check` (or `cargo xtask test`) to verify that the new
 migration applies cleanly. To exercise the Postgres path, set
-`COMPONENT_DATABASE_URL=postgres://...` before running.
+`COMPONENT_DATABASE_URL=postgres://...` before running, but only for an
+ephemeral/test database: `cargo xtask sql check` runs `Migrator::up` against
+the target Postgres instance and will create tables in whatever database the
+URL points at. Never point it at a shared, persistent, or production database.
 
 ## Database Backend Selection
 

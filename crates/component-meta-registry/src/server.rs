@@ -16,8 +16,11 @@ use tower_http::trace::TraceLayer;
 
 /// Shared application state wrapping a `Manager` in a `tokio::sync::Mutex`.
 ///
-/// This is safe because all handler methods on `Manager` are synchronous
-/// (no `.await` while holding the lock).
+/// Handlers lock the `Manager` and may await async `Manager` methods while
+/// holding the mutex guard. This intentionally serializes access to
+/// `Manager`, which can simplify correctness if it must not be used
+/// concurrently, but it also reduces concurrency and may limit throughput
+/// because requests that need the manager run one at a time.
 ///
 /// # Example
 ///

@@ -5,7 +5,7 @@
 //! * `sqlite://...` — local file or `sqlite::memory:`. Default if no URL
 //!   is configured. Auto-migrates on `Store::open`.
 //! * `postgres://...` — remote PostgreSQL. Production deploys must run
-//!   migrations manually via `wasm-cli admin migrate` before starting;
+//!   migrations manually via `component admin migrate` before starting;
 //!   `Store::open` refuses to start with pending migrations to avoid
 //!   races between replicas.
 //!
