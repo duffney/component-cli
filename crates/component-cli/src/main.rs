@@ -172,6 +172,7 @@ async fn main() -> miette::Result<()> {
 ///
 /// Identifies host flags as `--inherit-env`, `--inherit-network`,
 /// `--no-stdio`, `--global`/`-g`, plus value-taking flags `--env`,
+/// `--no-stdio`, `--global`/`-g`, plus value-taking flags `--env`,
 /// `--dir`, `--listen` (each followed by its value). Global flags
 /// (`-v`/`--verbose`, `-q`/`--quiet`, `--offline`, `--color`) that
 /// clap allows before subcommand positionals are also recognized.
@@ -206,7 +207,9 @@ fn quarantine_run_trailing_args(args: Vec<String>) -> Vec<String> {
     /// Host flags that consume the next argument as a value.
     const VALUED: &[&str] = &[
         // `run`-specific flags.
-        "--env", "--dir", "--listen",
+        "--env",
+        "--dir",
+        "--listen",
         // Global flags clap allows after the `run` subcommand token.
         "--color",
     ];
